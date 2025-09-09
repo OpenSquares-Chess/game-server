@@ -10,6 +10,7 @@ use futures_util::{StreamExt, SinkExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::str::FromStr;
+use rand::Rng;
 use anyhow::Result;
 
 #[derive(Deserialize)]
@@ -18,6 +19,7 @@ struct ConnectionRequest {
     uuid: String
 }
 
+#[derive(Clone)]
 struct Player {
     uuid: String,
     color: Color,
@@ -85,27 +87,34 @@ fn pretty_board(board: &Board) -> String {
 
 async fn handle_game(
     read: &mut SplitStream<WebSocketStream<TcpStream>>,
+    write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     room: &Mutex<Room>,
-    player_uuid: String, color: Color
+    player_uuid: String,
+    color: Color
 ) -> Result<()> {
     while let Some(msg) = read.next().await {
         let msg = msg?;
         if msg.is_text() {
             let received_text = msg.to_text()?;
             println!("Received message: {}", received_text);
-            let players_to_notify = {
+            let current_position: String;
+            let players: Vec<Player>;
+            {
                 let mut room = room.lock().await;
-                room.game.make_move(ChessMove::from_str(&received_text).unwrap());
-                room.players.iter()
-                    .map(|p| (p.uuid.clone(), Arc::clone(&p.write_stream)))
-                    .collect::<Vec<_>>()
-            };
-            let current_position = pretty_board(&room.lock().await.game.current_position());
-            for (uuid, write_stream) in players_to_notify {
-                if uuid != player_uuid {
-                    write_stream.lock().await.send(Message::Text(received_text.clone().into())).await?;
+                if room.game.side_to_move() != color {
+                    drop(room);
+                    write.lock().await.send(Message::Text("Not your turn".into())).await?;
+                    continue;
                 }
-                write_stream.lock().await.send(Message::Text(current_position.clone().into())).await?;
+                room.game.make_move(ChessMove::from_str(&received_text).unwrap());
+                current_position = pretty_board(&room.game.current_position());
+                players = room.players.clone();
+            }
+            for player in players {
+                if player.uuid != player_uuid {
+                    player.write_stream.lock().await.send(Message::Text(received_text.into())).await?;
+                }
+                player.write_stream.lock().await.send(Message::Text(current_position.clone().into())).await?;
             }
         }
     }
@@ -134,6 +143,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: Arc<Vec<Mutex<R
                     let room = &rooms[room_id];
                     let player_uuid: String;
                     let color: Color;
+                    let current_position: String;
                     {
                         let mut room = room.lock().await;
                         if room.players.len() == 2 {
@@ -142,14 +152,18 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: Arc<Vec<Mutex<R
                             continue;
                         }
                         player_uuid = request.uuid.clone();
-                        color = if room.players.len() == 0 { Color::White } else { Color::Black };
+                        if room.players.len() == 0 {
+                            color = if rand::rng().random_bool(0.5) { Color::White } else { Color::Black };
+                        } else {
+                            color = if room.players[0].color == Color::White { Color::Black } else { Color::White };
+                        }
                         room.players.push(Player { uuid: request.uuid, color: color, write_stream: Arc::clone(&write) });
                         println!("Player {} joined room {}", player_uuid, room_id);
                         println!("Room {} has {} players", room_id, room.players.len());
+                        current_position = pretty_board(&room.game.current_position());
                     }
-                    let current_position = pretty_board(&room.lock().await.game.current_position());
                     write.lock().await.send(Message::Text(current_position.into())).await?;
-                    handle_game(&mut read, room, player_uuid.clone(), color).await?;
+                    handle_game(&mut read, Arc::clone(&write), room, player_uuid.clone(), color).await?;
                 }
                 Err(e) => {
                     println!("Error parsing connection request: {}", e);
