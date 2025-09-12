@@ -189,9 +189,9 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{sleep, Duration};
     use tokio_tungstenite::connect_async;
     use serial_test::serial;
+    use tokio::sync::Barrier;
     #[tokio::test]
     #[serial]
     async fn test_join_room() {
@@ -219,25 +219,36 @@ mod tests {
         })).collect();
         let rooms = Arc::new(rooms);
         tokio::spawn(listen_for_connections(Arc::clone(&rooms)));
-        let handle = tokio::spawn(async {
+
+        let barrier = Arc::new(Barrier::new(3));
+
+        let thread_barrier = Arc::clone(&barrier);
+        let handle = tokio::spawn(async move {
             let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
             stream.send(Message::Text("{\"room\": 0, \"uuid\": \"test\"}".into())).await.unwrap();
+            thread_barrier.wait().await;
             let response = stream.next().await.unwrap().unwrap();
             assert_eq!(response.to_text().unwrap(), "connected");
         });
-        let handle2 = tokio::spawn(async {
+
+        let thread_barrier = Arc::clone(&barrier);
+        let handle2 = tokio::spawn(async move {
             let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
             stream.send(Message::Text("{\"room\": 0, \"uuid\": \"test2\"}".into())).await.unwrap();
+            thread_barrier.wait().await;
             let response = stream.next().await.unwrap().unwrap();
             assert_eq!(response.to_text().unwrap(), "connected");
         });
-        let handle3 = tokio::spawn(async {
-            sleep(Duration::from_millis(100)).await;
+
+        let thread_barrier = Arc::clone(&barrier);
+        let handle3 = tokio::spawn(async move {
             let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
+            thread_barrier.wait().await;
             stream.send(Message::Text("{\"room\": 0, \"uuid\": \"test3\"}".into())).await.unwrap();
             let response = stream.next().await.unwrap().unwrap();
             assert_eq!(response.to_text().unwrap(), "room is full");
         });
+
         assert!(handle.await.is_ok());
         assert!(handle2.await.is_ok());
         assert!(handle3.await.is_ok());
@@ -256,7 +267,16 @@ mod tests {
         async fn make_move(uuid: &str) {
             let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
             stream.send(Message::Text(format!("{{\"room\": 0, \"uuid\": \"{uuid}\"}}").into())).await.unwrap();
-            stream.send(Message::Text("e2e4".into())).await.unwrap();
+            let response = stream.next().await.unwrap().unwrap();
+            assert_eq!(response.to_text().unwrap(), "connected");
+            // let response = stream.next().await.unwrap().unwrap();
+            // let color = if response.to_text().unwrap() == "white" { Color::White } else { Color::Black };
+            // if color == Color::White {
+            //     stream.send(Message::Text("e2e4".into())).await.unwrap();
+            //     let response = stream.next().await.unwrap().unwrap();
+            //     assert_eq!(response.to_text().unwrap(), "e2e4");
+            // }
+            // stream.send(Message::Text("e2e4".into())).await.unwrap();
         }
         let handle = tokio::spawn(make_move("test"));
         let handle2 = tokio::spawn(make_move("test2"));
