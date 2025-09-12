@@ -1,6 +1,5 @@
 use chess::{Game, Board, ChessMove, Color, Piece, Square, Rank, File};
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, TcpListener};
 use tokio::sync::Mutex;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async;
@@ -19,27 +18,32 @@ struct ConnectionRequest {
     uuid: String
 }
 
-#[derive(Clone)]
 struct Player {
     uuid: String,
-    color: Color,
     write_stream: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>
 }
 
 struct Room {
-    players: Vec<Player>,
+    players: [Option<Player>; 2],
     game: Game
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rooms: Vec<Mutex<Room>> = (0..10).map(|_| Mutex::new(Room { players: Vec::new(), game: Game::new() })).collect();
+    let rooms: Vec<Mutex<Room>> = (0..10).map(|_| Mutex::new(Room {
+        players: [None, None],
+        game: Game::new()
+    })).collect();
     let rooms = Arc::new(rooms);
+    listen_for_connections(Arc::clone(&rooms)).await?;
 
+    Ok(())
+}
+
+async fn listen_for_connections(rooms: Arc<Vec<Mutex<Room>>>) -> Result<()> {
     let addr = "0.0.0.0:8080".to_string();
     let listener = TcpListener::bind(&addr).await?;
-    println!("WebSocket server started on ws://{}", addr);
-
+    println!("Connection listener started on http://{}", addr);
     while let Ok((stream, _)) = listener.accept().await {
         tokio::spawn(handle_connection(stream, Arc::clone(&rooms)));
     }
@@ -89,7 +93,6 @@ async fn handle_game(
     read: &mut SplitStream<WebSocketStream<TcpStream>>,
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     room: &Mutex<Room>,
-    player_uuid: String,
     color: Color
 ) -> Result<()> {
     while let Some(msg) = read.next().await {
@@ -98,36 +101,35 @@ async fn handle_game(
             let received_text = msg.to_text()?;
             println!("Received message: {}", received_text);
             let current_position: String;
-            let players: Vec<Player>;
+            let opponent_write: Option<Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>>;
             {
                 let mut room = room.lock().await;
                 if room.game.side_to_move() != color {
                     drop(room);
-                    write.lock().await.send(Message::Text("Not your turn".into())).await?;
+                    write.lock().await.send(Message::Text("not your turn".into())).await?;
                     continue;
                 }
                 room.game.make_move(ChessMove::from_str(&received_text).unwrap());
                 current_position = pretty_board(&room.game.current_position());
-                players = room.players.clone();
+                opponent_write = room.players[color.to_index() ^ 1].as_ref().map(|p| Arc::clone(&p.write_stream));
             }
-            for player in players {
-                if player.uuid != player_uuid {
-                    player.write_stream.lock().await.send(Message::Text(received_text.into())).await?;
-                }
-                player.write_stream.lock().await.send(Message::Text(current_position.clone().into())).await?;
+            write.lock().await.send(Message::Text(current_position.clone().into())).await?;
+            if let Some(opponent_write) = opponent_write {
+                opponent_write.lock().await.send(Message::Text(received_text.into())).await?;
+                opponent_write.lock().await.send(Message::Text(current_position.clone().into())).await?;
             }
         }
     }
 
     {
         let mut room = room.lock().await;
-        room.players.retain(|p| p.uuid != player_uuid);
+        room.players[color.to_index()] = None;
     }
 
     Ok(())
 }
 
-async fn handle_connection(stream: tokio::net::TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> Result<()> {
+async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> Result<()> {
     let (write, mut read) = accept_async(stream).await?.split();
     let write = Arc::new(Mutex::new(write));
     println!("WebSocket connection established");
@@ -141,33 +143,41 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: Arc<Vec<Mutex<R
                     println!("Received connection request for room {}", request.room);
                     let room_id = request.room as usize;
                     let room = &rooms[room_id];
-                    let player_uuid: String;
                     let color: Color;
                     let current_position: String;
                     {
                         let mut room = room.lock().await;
-                        if room.players.len() == 2 {
-                            drop(room);
-                            write.lock().await.send(Message::Text("Room is full".into())).await?;
-                            continue;
+                        match (room.players[0].is_some(), room.players[1].is_some()) {
+                            (true, true) => {
+                                drop(room);
+                                write.lock().await.send(Message::Text("room is full".into())).await?;
+                                continue;
+                            }
+                            (true, false) => {
+                                color = Color::Black;
+                            }
+                            (false, true) => {
+                                color = Color::White;
+                            }
+                            (false, false) => {
+                                color = if rand::rng().random_bool(0.5) { Color::White } else { Color::Black };
+                            }
                         }
-                        player_uuid = request.uuid.clone();
-                        if room.players.len() == 0 {
-                            color = if rand::rng().random_bool(0.5) { Color::White } else { Color::Black };
-                        } else {
-                            color = if room.players[0].color == Color::White { Color::Black } else { Color::White };
-                        }
-                        room.players.push(Player { uuid: request.uuid, color: color, write_stream: Arc::clone(&write) });
-                        println!("Player {} joined room {}", player_uuid, room_id);
+                        room.players[color.to_index()] = Some(Player {
+                            uuid: request.uuid.clone(),
+                            write_stream: Arc::clone(&write)
+                        });
+                        println!("Player {} joined room {}", request.uuid, room_id);
                         println!("Room {} has {} players", room_id, room.players.len());
                         current_position = pretty_board(&room.game.current_position());
                     }
+                    write.lock().await.send(Message::Text("connected".into())).await?;
                     write.lock().await.send(Message::Text(current_position.into())).await?;
-                    handle_game(&mut read, Arc::clone(&write), room, player_uuid.clone(), color).await?;
+                    handle_game(&mut read, Arc::clone(&write), room, color).await?;
                 }
                 Err(e) => {
                     println!("Error parsing connection request: {}", e);
-                    write.lock().await.send(Message::Text("Invalid request".into())).await?;
+                    write.lock().await.send(Message::Text("invalid request".into())).await?;
                 }
             }
         }
@@ -175,4 +185,84 @@ async fn handle_connection(stream: tokio::net::TcpStream, rooms: Arc<Vec<Mutex<R
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Duration};
+    use tokio_tungstenite::connect_async;
+    use serial_test::serial;
+    #[tokio::test]
+    #[serial]
+    async fn test_join_room() {
+        let rooms: Vec<Mutex<Room>> = (0..10).map(|_| Mutex::new(Room {
+            players: [None, None],
+            game: Game::new()
+        })).collect();
+        let rooms = Arc::new(rooms);
+        tokio::spawn(listen_for_connections(Arc::clone(&rooms)));
+        let handle = tokio::spawn(async {
+            let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
+            stream.send(Message::Text("{\"room\": 0, \"uuid\": \"test\"}".into())).await.unwrap();
+            let response = stream.next().await.unwrap().unwrap();
+            assert_eq!(response.to_text().unwrap(), "connected");
+        });
+        assert!(handle.await.is_ok());
+    }
+    
+    #[tokio::test]
+    #[serial]
+    async fn test_full_room() {
+        let rooms: Vec<Mutex<Room>> = (0..10).map(|_| Mutex::new(Room {
+            players: [None, None],
+            game: Game::new()
+        })).collect();
+        let rooms = Arc::new(rooms);
+        tokio::spawn(listen_for_connections(Arc::clone(&rooms)));
+        let handle = tokio::spawn(async {
+            let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
+            stream.send(Message::Text("{\"room\": 0, \"uuid\": \"test\"}".into())).await.unwrap();
+            let response = stream.next().await.unwrap().unwrap();
+            assert_eq!(response.to_text().unwrap(), "connected");
+        });
+        let handle2 = tokio::spawn(async {
+            let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
+            stream.send(Message::Text("{\"room\": 0, \"uuid\": \"test2\"}".into())).await.unwrap();
+            let response = stream.next().await.unwrap().unwrap();
+            assert_eq!(response.to_text().unwrap(), "connected");
+        });
+        let handle3 = tokio::spawn(async {
+            sleep(Duration::from_millis(100)).await;
+            let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
+            stream.send(Message::Text("{\"room\": 0, \"uuid\": \"test3\"}".into())).await.unwrap();
+            let response = stream.next().await.unwrap().unwrap();
+            assert_eq!(response.to_text().unwrap(), "room is full");
+        });
+        assert!(handle.await.is_ok());
+        assert!(handle2.await.is_ok());
+        assert!(handle3.await.is_ok());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_make_moves() {
+        let rooms: Vec<Mutex<Room>> = (0..10).map(|_| Mutex::new(Room {
+            players: [None, None],
+            game: Game::new()
+        })).collect();
+        let rooms = Arc::new(rooms);
+        tokio::spawn(listen_for_connections(Arc::clone(&rooms)));
+
+        async fn make_move(uuid: &str) {
+            let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
+            stream.send(Message::Text(format!("{{\"room\": 0, \"uuid\": \"{uuid}\"}}").into())).await.unwrap();
+            stream.send(Message::Text("e2e4".into())).await.unwrap();
+        }
+        let handle = tokio::spawn(make_move("test"));
+        let handle2 = tokio::spawn(make_move("test2"));
+        assert!(handle.await.is_ok());
+        assert!(handle2.await.is_ok());
+    }
+}
+
 
