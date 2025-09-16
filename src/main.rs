@@ -110,7 +110,7 @@ async fn handle_game(
                     continue;
                 }
                 room.game.make_move(ChessMove::from_str(&received_text).unwrap());
-                current_position = pretty_board(&room.game.current_position());
+                current_position = format!("{}", &room.game.current_position());
                 opponent_write = room.players[color.to_index() ^ 1].as_ref().map(|p| Arc::clone(&p.write_stream));
             }
             write.lock().await.send(Message::Text(current_position.clone().into())).await?;
@@ -169,9 +169,11 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
                         });
                         println!("Player {} joined room {}", request.uuid, room_id);
                         println!("Room {} has {} players", room_id, room.players.len());
-                        current_position = pretty_board(&room.game.current_position());
+                        current_position = format!("{}", &room.game.current_position());
                     }
                     write.lock().await.send(Message::Text("connected".into())).await?;
+                    let color_str = if color == Color::White { "white" } else { "black" };
+                    write.lock().await.send(Message::Text(color_str.into())).await?;
                     write.lock().await.send(Message::Text(current_position.into())).await?;
                     handle_game(&mut read, Arc::clone(&write), room, color).await?;
                 }
@@ -264,22 +266,48 @@ mod tests {
         let rooms = Arc::new(rooms);
         tokio::spawn(listen_for_connections(Arc::clone(&rooms)));
 
-        async fn make_move(uuid: &str) {
+        let barrier = Arc::new(Barrier::new(2));
+        async fn make_move(uuid: &str, barrier: Arc<Barrier>) {
             let (mut stream, _) = connect_async("ws://localhost:8080").await.unwrap();
             stream.send(Message::Text(format!("{{\"room\": 0, \"uuid\": \"{uuid}\"}}").into())).await.unwrap();
             let response = stream.next().await.unwrap().unwrap();
             assert_eq!(response.to_text().unwrap(), "connected");
-            // let response = stream.next().await.unwrap().unwrap();
-            // let color = if response.to_text().unwrap() == "white" { Color::White } else { Color::Black };
-            // if color == Color::White {
-            //     stream.send(Message::Text("e2e4".into())).await.unwrap();
-            //     let response = stream.next().await.unwrap().unwrap();
-            //     assert_eq!(response.to_text().unwrap(), "e2e4");
-            // }
-            // stream.send(Message::Text("e2e4".into())).await.unwrap();
+            let response = stream.next().await.unwrap().unwrap();
+            let color = response.to_text().unwrap();
+            let response = stream.next().await.unwrap().unwrap();
+            assert_eq!(response.to_text().unwrap(), "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+            if color == "white" {
+                barrier.wait().await;
+                stream.send(Message::Text("e2e4".into())).await.unwrap();
+                let response = stream.next().await.unwrap().unwrap();
+                assert_eq!(response.to_text().unwrap(), "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+                stream.send(Message::Text("e7e5".into())).await.unwrap();
+                let response = stream.next().await.unwrap().unwrap();
+                assert_eq!(response.to_text().unwrap(), "not your turn");
+                barrier.wait().await;
+                let response = stream.next().await.unwrap().unwrap();
+                assert_eq!(response.to_text().unwrap(), "e7e5");
+                let response = stream.next().await.unwrap().unwrap();
+                assert_eq!(response.to_text().unwrap(), "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1");
+            } else if color == "black" {
+                stream.send(Message::Text("e2e4".into())).await.unwrap();
+                let response = stream.next().await.unwrap().unwrap();
+                assert_eq!(response.to_text().unwrap(), "not your turn");
+                barrier.wait().await;
+                let response = stream.next().await.unwrap().unwrap();
+                assert_eq!(response.to_text().unwrap(), "e2e4");
+                let response = stream.next().await.unwrap().unwrap();
+                assert_eq!(response.to_text().unwrap(), "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+                barrier.wait().await;
+                stream.send(Message::Text("e7e5".into())).await.unwrap();
+                let response = stream.next().await.unwrap().unwrap();
+                assert_eq!(response.to_text().unwrap(), "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 1");
+            } else {
+                panic!("invalid color");
+            }
         }
-        let handle = tokio::spawn(make_move("test"));
-        let handle2 = tokio::spawn(make_move("test2"));
+        let handle = tokio::spawn(make_move("test", Arc::clone(&barrier)));
+        let handle2 = tokio::spawn(make_move("test2", Arc::clone(&barrier)));
         assert!(handle.await.is_ok());
         assert!(handle2.await.is_ok());
     }
