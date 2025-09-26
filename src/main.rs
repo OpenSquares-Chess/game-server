@@ -6,17 +6,13 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{StreamExt, SinkExt};
-use serde::Deserialize;
 use std::sync::Arc;
 use std::str::FromStr;
 use rand::Rng;
 use anyhow::Result;
 
-#[derive(Deserialize)]
-struct ConnectionRequest {
-    room: u32,
-    uuid: String
-}
+mod messages;
+use messages::{received::ConnectionRequest, response::Response};
 
 struct Player {
     uuid: String,
@@ -99,24 +95,32 @@ async fn handle_game(
         let msg = msg?;
         if msg.is_text() {
             let received_text = msg.to_text()?;
-            println!("Received message: {}", received_text);
             let current_position: String;
             let opponent_write: Option<Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>>;
             {
                 let mut room = room.lock().await;
                 if room.game.side_to_move() != color {
                     drop(room);
-                    write.lock().await.send(Message::Text("not your turn".into())).await?;
+                    let response = Response::OutOfTurnMove;
+                    let response = Message::Text(serde_json::to_string(&response)?.into());
+                    write.lock().await.send(response).await?;
                     continue;
                 }
                 room.game.make_move(ChessMove::from_str(&received_text).unwrap());
                 current_position = format!("{}", &room.game.current_position());
                 opponent_write = room.players[color.to_index() ^ 1].as_ref().map(|p| Arc::clone(&p.write_stream));
             }
-            write.lock().await.send(Message::Text(current_position.clone().into())).await?;
+            let response = Response::Fen { fen: current_position.clone() };
+            let response = Message::Text(serde_json::to_string(&response)?.into());
+            write.lock().await.send(response).await?;
             if let Some(opponent_write) = opponent_write {
-                opponent_write.lock().await.send(Message::Text(received_text.into())).await?;
-                opponent_write.lock().await.send(Message::Text(current_position.clone().into())).await?;
+                let response = Response::Move { move_: received_text.into() };
+                let response = Message::Text(serde_json::to_string(&response)?.into());
+                opponent_write.lock().await.send(response).await?;
+
+                let response = Response::Fen { fen: current_position.clone() };
+                let response = Message::Text(serde_json::to_string(&response)?.into());
+                opponent_write.lock().await.send(response).await?;
             }
         }
     }
@@ -124,6 +128,9 @@ async fn handle_game(
     {
         let mut room = room.lock().await;
         room.players[color.to_index()] = None;
+        if room.players[0].is_none() && room.players[1].is_none() {
+            room.game = Game::new();
+        }
     }
 
     Ok(())
@@ -132,7 +139,6 @@ async fn handle_game(
 async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> Result<()> {
     let (write, mut read) = accept_async(stream).await?.split();
     let write = Arc::new(Mutex::new(write));
-    println!("WebSocket connection established");
 
     while let Some(msg) = read.next().await {
         let msg = msg?;
@@ -140,7 +146,6 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
             let received_text = msg.to_text()?;
             match serde_json::from_str::<ConnectionRequest>(&received_text) {
                 Ok(request) => {
-                    println!("Received connection request for room {}", request.room);
                     let room_id = request.room as usize;
                     let room = &rooms[room_id];
                     let color: Color;
@@ -150,7 +155,9 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
                         match (room.players[0].is_some(), room.players[1].is_some()) {
                             (true, true) => {
                                 drop(room);
-                                write.lock().await.send(Message::Text("room is full".into())).await?;
+                                let response = Response::RoomFull;
+                                let response = Message::Text(serde_json::to_string(&response)?.into());
+                                write.lock().await.send(response).await?;
                                 continue;
                             }
                             (true, false) => {
@@ -167,18 +174,25 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
                             uuid: request.uuid.clone(),
                             write_stream: Arc::clone(&write)
                         });
-                        println!("Player {} joined room {}", request.uuid, room_id);
-                        println!("Room {} has {} players", room_id, room.players.len());
                         current_position = format!("{}", &room.game.current_position());
                     }
-                    write.lock().await.send(Message::Text("connected".into())).await?;
+
+                    let reponse = Response::Connected;
+                    let reponse = Message::Text(serde_json::to_string(&reponse)?.into());
+                    write.lock().await.send(reponse).await?;
+
                     let color_str = if color == Color::White { "white" } else { "black" };
-                    write.lock().await.send(Message::Text(color_str.into())).await?;
-                    write.lock().await.send(Message::Text(current_position.into())).await?;
+                    let response = Response::Color { color: color_str.into() };
+                    let response = Message::Text(serde_json::to_string(&response)?.into());
+                    write.lock().await.send(response).await?;
+
+                    let response = Response::Fen { fen: current_position.clone() };
+                    let response = Message::Text(serde_json::to_string(&response)?.into());
+                    write.lock().await.send(response).await?;
+
                     handle_game(&mut read, Arc::clone(&write), room, color).await?;
                 }
-                Err(e) => {
-                    println!("Error parsing connection request: {}", e);
+                Err(_e) => {
                     write.lock().await.send(Message::Text("invalid request".into())).await?;
                 }
             }
