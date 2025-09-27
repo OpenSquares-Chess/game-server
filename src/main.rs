@@ -1,6 +1,7 @@
 use chess::{Game, Board, ChessMove, Color, Piece, Square, Rank, File};
 use tokio::net::{TcpStream, TcpListener};
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -91,10 +92,15 @@ async fn handle_game(
     room: &Mutex<Room>,
     color: Color
 ) -> Result<()> {
-    while let Some(msg) = read.next().await {
+    while let Ok(Some(msg)) = timeout(Duration::from_secs(55), read.next()).await {
         let msg = msg?;
         if msg.is_text() {
             let received_text = msg.to_text()?;
+            if received_text == "ping" {
+                let response = Message::Text("pong".into());
+                write.lock().await.send(response).await?;
+                continue;
+            }
             let current_position: String;
             let opponent_write: Option<Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>>;
             {
@@ -140,10 +146,15 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
     let (write, mut read) = accept_async(stream).await?.split();
     let write = Arc::new(Mutex::new(write));
 
-    while let Some(msg) = read.next().await {
+    while let Ok(Some(msg)) = timeout(Duration::from_secs(55), read.next()).await {
         let msg = msg?;
         if msg.is_text() {
             let received_text = msg.to_text()?;
+            if received_text == "ping" {
+                let response = Message::Text("pong".into());
+                write.lock().await.send(response).await?;
+                continue;
+            }
             match serde_json::from_str::<ConnectionRequest>(&received_text) {
                 Ok(request) => {
                     let room_id = request.room as usize;
@@ -193,7 +204,9 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
                     handle_game(&mut read, Arc::clone(&write), room, color).await?;
                 }
                 Err(_e) => {
-                    write.lock().await.send(Message::Text("invalid request".into())).await?;
+                    let response = Response::InvalidRequest;
+                    let response = Message::Text(serde_json::to_string(&response)?.into());
+                    write.lock().await.send(response).await?;
                 }
             }
         }

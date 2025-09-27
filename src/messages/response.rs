@@ -4,9 +4,11 @@ use serde::{Serialize};
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
+    InvalidRequest,
+
     Move { 
         #[serde(rename = "move")]
-        move_: String, 
+        move_: String,
     },
 
     OutOfTurnMove,
