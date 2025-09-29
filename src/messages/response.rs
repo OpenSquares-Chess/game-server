@@ -11,6 +11,8 @@ pub enum Response {
         move_: String,
     },
 
+    InvalidMove,
+
     OutOfTurnMove,
 
     Fen { 
