@@ -1,7 +1,7 @@
 use chess::{Game, ChessMove, Color};
 use tokio::net::{TcpStream, TcpListener};
-use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::sync::{oneshot, Mutex};
+use tokio::time::{timeout, interval, Duration};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -58,11 +58,6 @@ async fn handle_game(
         let msg = msg?;
         if msg.is_text() {
             let received_text = msg.to_text()?;
-            if received_text == "ping" {
-                let response = Message::Text("pong".into());
-                write.lock().await.send(response).await?;
-                continue;
-            }
             let current_position: String;
             let opponent_write: Option<Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>>;
             {
@@ -103,19 +98,15 @@ async fn handle_game(
     Ok(())
 }
 
-async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> Result<()> {
-    let (write, mut read) = accept_async(stream).await?.split();
-    let write = Arc::new(Mutex::new(write));
-
+async fn handle_lobby(
+    read: &mut SplitStream<WebSocketStream<TcpStream>>,
+    write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
+    rooms: Arc<Vec<Mutex<Room>>>
+) -> Result<()> {
     while let Ok(Some(msg)) = timeout(Duration::from_secs(55), read.next()).await {
         let msg = msg?;
         if msg.is_text() {
             let received_text = msg.to_text()?;
-            if received_text == "ping" {
-                let response = Message::Text("pong".into());
-                write.lock().await.send(response).await?;
-                continue;
-            }
             match serde_json::from_str::<ConnectionRequest>(&received_text) {
                 Ok(request) => {
                     let room_id = request.room as usize;
@@ -149,7 +140,7 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
                         current_position = format!("{}", &room.game.current_position());
                     }
 
-                    let _: Result<()> = {
+                    let _ = async || -> Result<()> {
                         let reponse = Response::Connected;
                         let reponse = Message::Text(serde_json::to_string(&reponse)?.into());
                         write.lock().await.send(reponse).await?;
@@ -163,7 +154,7 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
                         let response = Message::Text(serde_json::to_string(&response)?.into());
                         write.lock().await.send(response).await?;
 
-                        handle_game(&mut read, Arc::clone(&write), room, color).await?;
+                        handle_game(read, Arc::clone(&write), room, color).await?;
 
                         Ok(())
                     };
@@ -184,6 +175,40 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
             }
         }
     }
+
+    Ok(())
+}
+
+async fn handle_heartbeat(
+    write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> Result<()> {
+    let mut interval = interval(Duration::from_secs(20));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let result = write.lock().await.send(Message::Ping(vec![].into())).await;
+                if result.is_err() {
+                    break;
+                }
+            }
+            _ = &mut shutdown_rx => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> Result<()> {
+    let (write, mut read) = accept_async(stream).await?.split();
+    let write = Arc::new(Mutex::new(write));
+
+    let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(handle_heartbeat(Arc::clone(&write), shutdown_rx));
+
+    handle_lobby(&mut read, Arc::clone(&write), rooms).await?;
 
     Ok(())
 }
