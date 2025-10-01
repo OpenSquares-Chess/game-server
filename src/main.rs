@@ -54,7 +54,7 @@ async fn handle_game(
     room: &Mutex<Room>,
     color: Color
 ) -> Result<()> {
-    while let Ok(Some(msg)) = timeout(Duration::from_secs(55), read.next()).await {
+    while let Ok(Some(msg)) = timeout(Duration::from_secs(60), read.next()).await {
         let msg = msg?;
         if msg.is_text() {
             let received_text = msg.to_text()?;
@@ -103,7 +103,7 @@ async fn handle_lobby(
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     rooms: Arc<Vec<Mutex<Room>>>
 ) -> Result<()> {
-    while let Ok(Some(msg)) = timeout(Duration::from_secs(55), read.next()).await {
+    while let Ok(Some(msg)) = timeout(Duration::from_secs(60), read.next()).await {
         let msg = msg?;
         if msg.is_text() {
             let received_text = msg.to_text()?;
@@ -157,7 +157,7 @@ async fn handle_lobby(
                         handle_game(read, Arc::clone(&write), room, color).await?;
 
                         Ok(())
-                    };
+                    }().await;
 
                     {
                         let mut room = room.lock().await;
@@ -183,7 +183,7 @@ async fn handle_heartbeat(
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let mut interval = interval(Duration::from_secs(20));
+    let mut interval = interval(Duration::from_secs(25));
     loop {
         tokio::select! {
             _ = interval.tick() => {
