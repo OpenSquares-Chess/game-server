@@ -7,10 +7,11 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{StreamExt, SinkExt};
+use jwtk::jwk::RemoteJwksVerifier;
 use std::sync::Arc;
 use std::str::FromStr;
 use rand::Rng;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 mod messages;
 use messages::{received::ConnectionRequest, response::Response};
@@ -32,17 +33,26 @@ async fn main() -> Result<()> {
         game: Game::new()
     })).collect();
     let rooms = Arc::new(rooms);
-    listen_for_connections(Arc::clone(&rooms)).await?;
+
+    let jwks_url = "https://auth.opensquares.xyz/realms/opensquares/protocol/openid-connect/certs".to_string();
+    let cache_duration = Duration::from_secs(3600);
+    let verifier = RemoteJwksVerifier::new(jwks_url, None, cache_duration);
+    let verifier = Arc::new(verifier);
+
+    listen_for_connections(rooms, verifier).await?;
 
     Ok(())
 }
 
-async fn listen_for_connections(rooms: Arc<Vec<Mutex<Room>>>) -> Result<()> {
+async fn listen_for_connections(
+    rooms: Arc<Vec<Mutex<Room>>>,
+    verifier: Arc<RemoteJwksVerifier>
+) -> Result<()> {
     let addr = "0.0.0.0:8080".to_string();
     let listener = TcpListener::bind(&addr).await?;
     println!("Connection listener started on http://{}", addr);
     while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, Arc::clone(&rooms)));
+        tokio::spawn(handle_connection(stream, Arc::clone(&rooms), Arc::clone(&verifier)));
     }
 
     Ok(())
@@ -100,7 +110,8 @@ async fn handle_lobby(
     heartbeat_interval: &mut tokio::time::Interval,
     read: &mut SplitStream<WebSocketStream<TcpStream>>,
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
-    rooms: Arc<Vec<Mutex<Room>>>
+    rooms: Arc<Vec<Mutex<Room>>>,
+    sub_id: String
 ) -> Result<()> {
     if msg.is_text() {
         let received_text = msg.to_text()?;
@@ -131,7 +142,7 @@ async fn handle_lobby(
                         }
                     }
                     room.players[color.to_index()] = Some(Player {
-                        _uuid: request.uuid.clone(),
+                        _uuid: sub_id.clone(),
                         write_stream: Arc::clone(&write)
                     });
                     current_position = format!("{}", &room.game.current_position());
@@ -158,7 +169,12 @@ async fn handle_lobby(
                             }
                             msg = timeout(Duration::from_secs(60), read.next()) => {
                                 match msg {
-                                    Ok(Some(Ok(msg))) => handle_game(msg, Arc::clone(&write), room, color).await?,
+                                    Ok(Some(Ok(msg))) => handle_game(
+                                        msg,
+                                        Arc::clone(&write),
+                                        room,
+                                        color
+                                    ).await?,
                                     _ => break
                                 }
                             }
@@ -187,11 +203,62 @@ async fn handle_lobby(
     Ok(())
 }
 
-async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> Result<()> {
+async fn handle_auth(
+    msg: Message,
+    write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
+    verifier: Arc<RemoteJwksVerifier>
+) -> Result<String> {
+    if msg.is_text() {
+        match verifier.verify::<()>(msg.to_text()?).await {
+            Ok(header_and_claims) => {
+                write.lock().await.send(Message::Text("authenticated".into())).await?;
+                return Ok(header_and_claims.claims().sub.clone().expect("sub not found"));
+            }
+            Err(e) => {
+                write.lock().await.send(Message::Text(e.to_string().into())).await?;
+                return Err(e.into());
+            }
+        }
+    }
+
+    Err(anyhow!("message not text"))
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    rooms: Arc<Vec<Mutex<Room>>>,
+    verifier: Arc<RemoteJwksVerifier>
+) -> Result<()> {
     let (write, mut read) = accept_async(stream).await?.split();
     let write = Arc::new(Mutex::new(write));
 
     let mut hearbeat_interval = interval(Duration::from_secs(25));
+
+    let sub_id;
+    loop {
+        tokio::select! {
+            _ = hearbeat_interval.tick() => {
+                write.lock().await.send(Message::Ping(vec![].into())).await?;
+            }
+            msg = timeout(Duration::from_secs(60), read.next()) => {
+                match msg {
+                    Ok(Some(Ok(msg))) => {
+                        let result = handle_auth(
+                            msg,
+                            Arc::clone(&write),
+                            Arc::clone(&verifier)
+                        ).await;
+                        if result.is_ok() {
+                            sub_id = result.unwrap();
+                            break;
+                        }
+                    },
+                    _ => return Ok(()),
+                }
+            }
+        }
+    }
+
     loop {
         tokio::select! {
             _ = hearbeat_interval.tick() => {
@@ -204,7 +271,8 @@ async fn handle_connection(stream: TcpStream, rooms: Arc<Vec<Mutex<Room>>>) -> R
                         &mut hearbeat_interval,
                         &mut read,
                         Arc::clone(&write),
-                        Arc::clone(&rooms)
+                        Arc::clone(&rooms),
+                        sub_id.clone()
                     ).await?,
                     _ => break,
                 }
