@@ -4,6 +4,12 @@ use serde::{Serialize, Deserialize};
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
+    InvalidToken {
+        reason: String,
+    },
+    
+    TokenValidated,
+
     InvalidRequest,
 
     Move { 

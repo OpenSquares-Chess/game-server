@@ -216,11 +216,15 @@ async fn handle_auth(
                     write.lock().await.send(Message::Text("invalid audience".into())).await?;
                     return Err(anyhow!("invalid audience"));
                 }
-                write.lock().await.send(Message::Text("authenticated".into())).await?;
+                let response = Response::TokenValidated;
+                let response = Message::Text(serde_json::to_string(&response)?.into());
+                write.lock().await.send(response).await?;
                 return Ok(header_and_claims.claims().sub.clone().expect("sub not found"));
             }
             Err(e) => {
-                write.lock().await.send(Message::Text(e.to_string().into())).await?;
+                let response = Response::InvalidToken { reason: e.to_string() };
+                let response = Message::Text(serde_json::to_string(&response)?.into());
+                write.lock().await.send(response).await?;
                 return Err(e.into());
             }
         }
