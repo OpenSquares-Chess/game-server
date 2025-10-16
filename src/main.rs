@@ -211,6 +211,11 @@ async fn handle_auth(
     if msg.is_text() {
         match verifier.verify::<()>(msg.to_text()?).await {
             Ok(header_and_claims) => {
+                let audience = &header_and_claims.claims().aud;
+                if audience.iter().find(|aud| *aud == "game-server").is_none() {
+                    write.lock().await.send(Message::Text("invalid audience".into())).await?;
+                    return Err(anyhow!("invalid audience"));
+                }
                 write.lock().await.send(Message::Text("authenticated".into())).await?;
                 return Ok(header_and_claims.claims().sub.clone().expect("sub not found"));
             }
