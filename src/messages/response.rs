@@ -10,7 +10,13 @@ pub enum Response {
     
     TokenValidated,
 
-    InvalidRequest,
+    InvalidKey,
+
+    InvalidRequest {
+        reason: String,
+    },
+
+    RoomNotActive,
 
     Move { 
         #[serde(rename = "move")]
@@ -31,5 +37,5 @@ pub enum Response {
 
     Connected,
 
-    RoomFull,
+    GameCanceled,
 }
