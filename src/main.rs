@@ -34,15 +34,59 @@ struct Keys {
 } 
 
 struct Room {
+    id: usize,
     active: bool,
     players: [Option<Player>; 2],
     game: Game,
     keys: Option<Keys>
 }
 
+static REDIS_APPEND_ROOM: &str = r#"
+    local exists = redis.call('LPOS', KEYS[1], ARGV[1])
+    if not exists then
+        redis.call('LPUSH', KEYS[1], ARGV[1])
+        return 1
+    else
+        return 0
+    end
+"#;
+
+async fn reset_room(
+    room: &Mutex<Room>,
+    conn: redis::aio::ConnectionManager
+) -> Result<()> {
+    let room_id: usize;
+    let keys: String;
+    {
+        let mut room = room.lock().await;
+        room_id = room.id;
+        room.active = false;
+        room.keys = Some(Keys {
+            keys: generate_chess_keys(),
+            timestamp: 0
+        });
+        keys = serde_json::to_string(&room.keys)?;
+        room.game = Game::new();
+        room.players = [None, None];
+    }
+    let mut conn = conn.clone();
+
+    let mut cmd = redis::cmd("SET");
+    cmd.arg(format!("room:{}:keys", room_id)).arg(keys);
+    let _: bool = cmd.query_async(&mut conn).await?;
+
+    let script = redis::Script::new(REDIS_APPEND_ROOM);
+    let key = "rooms";
+    let arg = room_id.to_string();
+    let _: bool = script.key(key).arg(arg).invoke_async(&mut conn).await?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rooms: Vec<Mutex<Room>> = (0..10).map(|_| Mutex::new(Room {
+    let rooms: Vec<Mutex<Room>> = (0..10).map(|i| Mutex::new(Room {
+        id: i,
         active: false,
         players: [None, None],
         game: Game::new(),
@@ -57,7 +101,7 @@ async fn main() -> Result<()> {
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let client = redis::Client::open("redis://host.docker.internal:6379/?protocol=resp3")?;
+    let client = redis::Client::open("redis://localhost:6379/?protocol=resp3")?;
     let config = redis::aio::ConnectionManagerConfig::new()
         .set_automatic_resubscription()
         .set_push_sender(tx);
@@ -74,20 +118,26 @@ async fn main() -> Result<()> {
     });
     conn.subscribe("matchmaking:game").await?;
 
-    listen_for_connections(rooms, verifier).await?;
+    listen_for_connections(rooms, verifier, conn).await?;
 
     Ok(())
 }
 
 async fn listen_for_connections(
     rooms: Arc<Vec<Mutex<Room>>>,
-    verifier: Arc<RemoteJwksVerifier>
+    verifier: Arc<RemoteJwksVerifier>,
+    conn: redis::aio::ConnectionManager
 ) -> Result<()> {
-    let addr = "0.0.0.0:8080".to_string();
+    let addr = "0.0.0.0:8000".to_string();
     let listener = TcpListener::bind(&addr).await?;
     println!("Connection listener started on http://{}", addr);
     while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, Arc::clone(&rooms), Arc::clone(&verifier)));
+        tokio::spawn(handle_connection(
+            stream,
+            Arc::clone(&rooms),
+            Arc::clone(&verifier),
+            conn.clone()
+        ));
     }
 
     Ok(())
@@ -112,16 +162,8 @@ async fn broadcast_available_rooms(
     mut conn: redis::aio::ConnectionManager
 ) -> Result<()> {
     for (index, room) in rooms.iter().enumerate() {
-        let script = redis::Script::new(r#"
-            local exists = redis.call('LPOS', KEYS[1], ARGV[1])
-            if not exists then
-                redis.call('RPUSH', KEYS[1], ARGV[1])
-                return 1
-            else
-                return 0
-            end
-        "#);
-        let key = format!("rooms");
+        let script = redis::Script::new(REDIS_APPEND_ROOM);
+        let key = "rooms";
         let arg = index.to_string();
         let _: bool = script.key(key).arg(arg).invoke_async(&mut conn).await?;
         let keys: String;
@@ -179,28 +221,18 @@ async fn handle_match_found(
                     }
                 }
                 tokio::time::sleep(delay).await;
+                let room = &rooms[room_id];
                 let player1: Option<Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>>;
                 let player2: Option<Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>>;
-                let keys: String;
                 {
-                    let mut room = rooms[room_id].lock().await;
+                    let room = room.lock().await;
                     if !room.game.actions().is_empty() {
                         return Ok(())
                     }
-                    room.active = false;
-                    room.keys = Some(Keys {
-                        keys: generate_chess_keys(),
-                        timestamp: 0
-                    });
-                    keys = serde_json::to_string(&room.keys)?;
-                    room.game = Game::new();
                     player1 = room.players[0].as_ref().map(|p| Arc::clone(&p.write_stream));
                     player2 = room.players[1].as_ref().map(|p| Arc::clone(&p.write_stream));
-                    room.players = [None, None];
                 }
-                let mut cmd = redis::cmd("SET");
-                cmd.arg(format!("room:{}:keys", room_id)).arg(keys);
-                let _: bool = cmd.query_async(&mut conn).await?;
+                reset_room(&rooms[room_id], conn).await?;
                 let response = Response::GameCanceled;
                 let response = Message::Text(serde_json::to_string(&response)?.into());
                 if let Some(player1) = player1 {
@@ -222,19 +254,22 @@ async fn handle_match_found(
 struct Auth {
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     verifier: Arc<RemoteJwksVerifier>,
-    rooms: Arc<Vec<Mutex<Room>>>
+    rooms: Arc<Vec<Mutex<Room>>>,
+    conn: redis::aio::ConnectionManager
 }
 
 impl Auth {
     fn new(
         write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
         verifier: Arc<RemoteJwksVerifier>,
-        rooms: Arc<Vec<Mutex<Room>>>
+        rooms: Arc<Vec<Mutex<Room>>>,
+        conn: redis::aio::ConnectionManager
     ) -> Auth {
         Auth {
             write,
             verifier,
-            rooms
+            rooms,
+            conn
         }
     }
 
@@ -256,7 +291,8 @@ impl Auth {
                         Ok(ServerState::Lobby(Lobby {
                             sub_id: header_and_claims.claims().sub.clone().expect("sub not found"),
                             write: self.write,
-                            rooms: self.rooms
+                            rooms: self.rooms,
+                            conn: self.conn
                         }))
                     }
                     Err(err) => {
@@ -277,7 +313,8 @@ impl Auth {
 struct Lobby {
     sub_id: String,
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
-    rooms: Arc<Vec<Mutex<Room>>>
+    rooms: Arc<Vec<Mutex<Room>>>,
+    conn: redis::aio::ConnectionManager
 }
 
 impl Lobby {
@@ -347,10 +384,15 @@ impl Lobby {
                             Ok(_) => {}
                             Err(err) => {
                                 let mut room = room.lock().await;
+                                let room_keys = room.keys.as_ref();
+                                if let Some(room_keys) = room_keys
+                                    && room_keys.keys[color.to_index()] != request.key {
+                                    return Err(err);
+                                }
                                 room.players[color.to_index()] = None;
                                 if room.players[0].is_none() && room.players[1].is_none() {
-                                    room.active = false;
-                                    room.game = Game::new();
+                                    drop(room);
+                                    reset_room(&self.rooms[room_id], self.conn).await?;
                                 }
                                 return Err(err);
                             }
@@ -361,8 +403,9 @@ impl Lobby {
                             key: request.key,
                             write: self.write,
                             rooms: self.rooms,
-                            room_id: room_id,
-                            color
+                            room_id,
+                            color,
+                            conn: self.conn
                         }))
                     }
                     Err(err) => {
@@ -386,7 +429,8 @@ struct GameInner {
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     rooms: Arc<Vec<Mutex<Room>>>,
     room_id: usize,
-    color: Color
+    color: Color,
+    conn: redis::aio::ConnectionManager
 }
 
 impl GameInner {
@@ -453,29 +497,42 @@ impl GameInner {
         msg: Message
     ) -> Result<ServerState> {
         let rooms = Arc::clone(&self.rooms);
+        let key = self.key.clone();
         let room_id = self.room_id;
         let color = self.color;
+        let conn = self.conn.clone();
         match self.try_next(msg).await {
             Ok(state) => Ok(state),
             Err(err) => {
                 let mut room = rooms[room_id].lock().await;
+                let room_keys = room.keys.as_ref();
+                if let Some(room_keys) = room_keys
+                    && room_keys.keys[color.to_index()] != key {
+                    return Err(err);
+                }
                 room.players[color.to_index()] = None;
                 if room.players[0].is_none() && room.players[1].is_none() {
-                    room.active = false;
-                    room.game = Game::new();
+                    drop(room);
+                    reset_room(&rooms[room_id], conn).await?
                 }
                 Err(err)
             }
         }
     }
 
-    async fn exit(self) {
+    async fn exit(self) -> Result<()> {
         let mut room = self.rooms[self.room_id].lock().await;
+        let room_keys = room.keys.as_ref();
+        if let Some(room_keys) = room_keys
+            && room_keys.keys[self.color.to_index()] != self.key {
+            return Ok(());
+        }
         room.players[self.color.to_index()] = None;
         if room.players[0].is_none() && room.players[1].is_none() {
-            room.active = false;
-            room.game = Game::new();
+            drop(room);
+            reset_room(&self.rooms[self.room_id], self.conn).await?;
         }
+        Ok(())
     }
 }
 
@@ -488,13 +545,19 @@ enum ServerState {
 async fn handle_connection(
     stream: TcpStream,
     rooms: Arc<Vec<Mutex<Room>>>,
-    verifier: Arc<RemoteJwksVerifier>
+    verifier: Arc<RemoteJwksVerifier>,
+    conn: redis::aio::ConnectionManager
 ) -> Result<()> {
     let (write, mut read) = accept_async(stream).await?.split();
     let write = Arc::new(Mutex::new(write));
 
     let mut hearbeat_interval = interval(Duration::from_secs(25));
-    let mut state = ServerState::Auth(Auth::new(Arc::clone(&write), Arc::clone(&verifier), Arc::clone(&rooms)));
+    let mut state = ServerState::Auth(Auth::new(
+        Arc::clone(&write),
+        Arc::clone(&verifier),
+        Arc::clone(&rooms),
+        conn
+    ));
     loop {
         tokio::select! {
             _ = hearbeat_interval.tick() => {
@@ -524,7 +587,7 @@ async fn handle_connection(
     }
 
     match state {
-        ServerState::Game(game) => game.exit().await,
+        ServerState::Game(game) => game.exit().await?,
         _ => (),
     }
 

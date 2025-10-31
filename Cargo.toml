@@ -16,3 +16,4 @@ serde_with = "3.15.1"
 serial_test = "3.2.0"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-tungstenite = "0.27.0"
+openssl = { version = "0.10.74", features = ["vendored"] }
