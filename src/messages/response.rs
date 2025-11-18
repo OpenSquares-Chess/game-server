@@ -37,5 +37,9 @@ pub enum Response {
 
     Connected,
 
+    GameOver{
+        winner: String,
+    },
+
     GameCanceled,
 }
