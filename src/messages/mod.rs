@@ -1,2 +1,2 @@
-pub mod received;
+pub mod request;
 pub mod response;
