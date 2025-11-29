@@ -674,17 +674,20 @@ impl GameInner {
                         let handle = tokio::spawn(async move {
                             tokio::time::sleep(tokio::time::Duration::from_millis(remaining_time)).await;
                             rooms[room_id].lock().await.player_timeout = None;
-                            upload_match(&rooms[room_id]).await?;
-                            reset_room(&rooms[room_id], conn).await?;
                             let winner = if color == Color::White { "white" } else { "black" };
-                            let response = Response::GameOver { winner: winner.to_string() };
+                            let response = Response::GameOver {
+                                winner: winner.to_string(),
+                                timeout: true
+                            };
                             let response = Message::Text(serde_json::to_string(&response)?.into());
-                            write.lock().await.send(response.clone()).await?;
-                            write.lock().await.send(Message::Close(None)).await?;
+                            let _ = write.lock().await.send(response.clone()).await;
+                            let _ = write.lock().await.send(Message::Close(None)).await;
                             if let Some(opponent_write) = opponent_write {
-                                opponent_write.lock().await.send(response).await?;
-                                opponent_write.lock().await.send(Message::Close(None)).await?;
+                                let _ = opponent_write.lock().await.send(response).await;
+                                let _ = opponent_write.lock().await.send(Message::Close(None)).await;
                             }
+                            let _ = upload_match(&rooms[room_id]).await;
+                            reset_room(&rooms[room_id], conn).await?;
                             Ok::<_, anyhow::Error>(())
                         });
                         room.player_timeout = Some(handle);
@@ -698,11 +701,11 @@ impl GameInner {
                     black_time
                 };
                 let response = Message::Text(serde_json::to_string(&response)?.into());
-                self.write.lock().await.send(response).await?;
+                let _ = self.write.lock().await.send(response).await;
                 if let Some(opponent_write) = opponent_write.clone() {
                     let response = Response::Move { move_: text.to_string() };
                     let response = Message::Text(serde_json::to_string(&response)?.into());
-                    opponent_write.lock().await.send(response).await?;
+                    let _ = opponent_write.lock().await.send(response).await;
 
                     let response = Response::Fen {
                         fen: current_position.clone(),
@@ -711,27 +714,39 @@ impl GameInner {
                         black_time
                     };
                     let response = Message::Text(serde_json::to_string(&response)?.into());
-                    opponent_write.lock().await.send(response).await?;
+                    let _ = opponent_write.lock().await.send(response).await;
                 }
 
                 if let Some(game_result) = game_result {
                     let response = match game_result {
-                        GameResult::WhiteCheckmates => Some(Response::GameOver { winner: "white".to_string() }),
-                        GameResult::BlackCheckmates => Some(Response::GameOver { winner: "black".to_string() }),
-                        GameResult::Stalemate => Some(Response::GameOver { winner: "draw".to_string() }),
-                        GameResult::DrawDeclared => Some(Response::GameOver { winner: "draw".to_string() }),
+                        GameResult::WhiteCheckmates => Some(Response::GameOver {
+                            winner: "white".to_string(),
+                            timeout: false
+                        }),
+                        GameResult::BlackCheckmates => Some(Response::GameOver {
+                            winner: "black".to_string(),
+                            timeout: false
+                        }),
+                        GameResult::Stalemate => Some(Response::GameOver {
+                            winner: "draw".to_string(),
+                            timeout: false
+                        }),
+                        GameResult::DrawDeclared => Some(Response::GameOver {
+                            winner: "draw".to_string(),
+                            timeout: false
+                        }),
                         _ => None
                     };
                     if let Some(response) = response {
-                        upload_match(&self.rooms[self.room_id]).await?;
-                        reset_room(&self.rooms[self.room_id], self.conn.clone()).await?;
                         let response = Message::Text(serde_json::to_string(&response)?.into());
-                        self.write.lock().await.send(response.clone()).await?;
-                        self.write.lock().await.send(Message::Close(None)).await?;
+                        let _ = self.write.lock().await.send(response.clone()).await;
+                        let _ = self.write.lock().await.send(Message::Close(None)).await;
                         if let Some(opponent_write) = opponent_write {
-                            opponent_write.lock().await.send(response).await?;
-                            opponent_write.lock().await.send(Message::Close(None)).await?;
+                            let _ = opponent_write.lock().await.send(response).await;
+                            let _ = opponent_write.lock().await.send(Message::Close(None)).await;
                         }
+                        let _ = upload_match(&self.rooms[self.room_id]).await;
+                        reset_room(&self.rooms[self.room_id], self.conn.clone()).await?;
                     }
                 }
 
