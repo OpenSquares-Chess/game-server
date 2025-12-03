@@ -4,7 +4,19 @@ use serde::{Serialize, Deserialize};
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
-    InvalidRequest,
+    InvalidToken {
+        reason: String,
+    },
+    
+    TokenValidated,
+
+    InvalidKey,
+
+    InvalidRequest {
+        reason: String,
+    },
+
+    RoomNotActive,
 
     Move { 
         #[serde(rename = "move")]
@@ -25,5 +37,9 @@ pub enum Response {
 
     Connected,
 
-    RoomFull,
+    GameOver{
+        winner: String,
+    },
+
+    GameCanceled,
 }
