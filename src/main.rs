@@ -1,4 +1,4 @@
-use chess::{Game, ChessMove, Color};
+use chess::{Game, GameResult, ChessMove, Color};
 use tokio::net::{TcpStream, TcpListener};
 use tokio::sync::Mutex;
 use tokio::time::{interval, timeout, Duration};
@@ -15,6 +15,8 @@ use rand::Rng;
 use anyhow::{anyhow, Result};
 use serde::{Serialize, Deserialize};
 use serde_with::{serde_as, DisplayFromStr};
+use dotenv::dotenv;
+use std::env;
 
 mod messages;
 use messages::{received::ConnectionRequest, response::Response};
@@ -85,6 +87,8 @@ async fn reset_room(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenv().ok();
+
     let rooms: Vec<Mutex<Room>> = (0..10).map(|i| Mutex::new(Room {
         id: i,
         active: false,
@@ -94,7 +98,13 @@ async fn main() -> Result<()> {
     })).collect();
     let rooms = Arc::new(rooms);
 
-    let jwks_url = "https://auth.opensquares.xyz/realms/opensquares/protocol/openid-connect/certs".to_string();
+
+    let jwks_url = match env::var("JWKS_URL") {
+        Ok(jwks_url) => Some(jwks_url),
+        Err(_) => None
+    };
+
+    let jwks_url = jwks_url.expect("JWKS_URL is not set");
     let cache_duration = Duration::from_secs(3600);
     let verifier = RemoteJwksVerifier::new(jwks_url, None, cache_duration);
     let verifier = Arc::new(verifier);
@@ -442,6 +452,7 @@ impl GameInner {
             Message::Text(text) => {
                 let current_position: String;
                 let opponent_write: Option<Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>>;
+                let game_result: Option<GameResult>;
                 {
                     let mut room = self.rooms[self.room_id].lock().await;
                     let room_key = room.keys.as_ref().map(|k| k.keys[self.color.to_index()]);
@@ -471,11 +482,13 @@ impl GameInner {
                     opponent_write = room.players[self.color.to_index() ^ 1]
                         .as_ref()
                         .map(|p| Arc::clone(&p.write_stream));
+                    game_result = room.game.result();
                 }
+
                 let response = Response::Fen { fen: current_position.clone() };
                 let response = Message::Text(serde_json::to_string(&response)?.into());
                 self.write.lock().await.send(response).await?;
-                if let Some(opponent_write) = opponent_write {
+                if let Some(opponent_write) = opponent_write.clone() {
                     let response = Response::Move { move_: text.to_string() };
                     let response = Message::Text(serde_json::to_string(&response)?.into());
                     opponent_write.lock().await.send(response).await?;
@@ -484,6 +497,25 @@ impl GameInner {
                     let response = Message::Text(serde_json::to_string(&response)?.into());
                     opponent_write.lock().await.send(response).await?;
                 }
+
+                if let Some(game_result) = game_result {
+                    let response = match game_result {
+                        GameResult::WhiteCheckmates => Some(Response::GameOver { winner: "white".to_string() }),
+                        GameResult::BlackCheckmates => Some(Response::GameOver { winner: "black".to_string() }),
+                        GameResult::Stalemate => Some(Response::GameOver { winner: "draw".to_string() }),
+                        _ => None
+                    };
+                    if let Some(response) = response {
+                        let response = Message::Text(serde_json::to_string(&response)?.into());
+                        self.write.lock().await.send(response.clone()).await?;
+                        self.write.lock().await.send(Message::Close(None)).await?;
+                        if let Some(opponent_write) = opponent_write {
+                            opponent_write.lock().await.send(response).await?;
+                            opponent_write.lock().await.send(Message::Close(None)).await?;
+                        }
+                    }
+                }
+
                 Ok(ServerState::Game(self))
             }
             _ => {
