@@ -2,6 +2,7 @@ use chess::{Game, GameResult, ChessMove, Color};
 use tokio::net::{TcpStream, TcpListener};
 use tokio::sync::Mutex;
 use tokio::time::{interval, timeout, Duration};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -10,7 +11,7 @@ use futures_util::{StreamExt, SinkExt};
 use jwtk::jwk::RemoteJwksVerifier;
 use std::sync::Arc;
 use std::str::FromStr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use rand::Rng;
 use anyhow::{anyhow, Result};
 use serde::{Serialize, Deserialize};
@@ -19,7 +20,7 @@ use dotenv::dotenv;
 use std::env;
 
 mod messages;
-use messages::{received::ConnectionRequest, response::Response};
+use messages::{request::Request, response::Response};
 
 #[derive(Clone)]
 struct Player {
@@ -40,7 +41,11 @@ struct Room {
     active: bool,
     players: [Option<Player>; 2],
     game: Game,
-    keys: Option<Keys>
+    keys: Option<Keys>,
+    start_time: u64,
+    last_move_time: u64,
+    remaining_time: [u64; 2],
+    player_timeout: Option<JoinHandle<Result<()>>>
 }
 
 static REDIS_APPEND_ROOM: &str = r#"
@@ -70,6 +75,12 @@ async fn reset_room(
         keys = serde_json::to_string(&room.keys)?;
         room.game = Game::new();
         room.players = [None, None];
+        room.start_time = 0;
+        room.last_move_time = 0;
+        room.remaining_time = [180000, 180000];
+        if let Some(handle) = room.player_timeout.take() {
+            handle.abort();
+        }
     }
     let mut conn = conn.clone();
 
@@ -94,10 +105,15 @@ async fn main() -> Result<()> {
         active: false,
         players: [None, None],
         game: Game::new(),
-        keys: None
+        keys: None,
+        start_time: 0,
+        last_move_time: 0,
+        remaining_time: [180000, 180000],
+        player_timeout: None
     })).collect();
     let rooms = Arc::new(rooms);
 
+    let clock = Instant::now();
 
     let jwks_url = match env::var("JWKS_URL") {
         Ok(jwks_url) => Some(jwks_url),
@@ -121,14 +137,20 @@ async fn main() -> Result<()> {
 
     let rooms_ref = Arc::clone(&rooms);
     let conn_copy = conn.clone();
+    let clock_copy = clock.clone();
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let _ = handle_match_found(msg, Arc::clone(&rooms_ref), conn_copy.clone()).await;
+            let _ = handle_match_found(
+                msg,
+                Arc::clone(&rooms_ref),
+                conn_copy.clone(),
+                clock_copy.clone()
+            ).await;
         }
     });
     conn.subscribe("matchmaking:game").await?;
 
-    listen_for_connections(rooms, verifier, conn).await?;
+    listen_for_connections(rooms, verifier, conn, clock).await?;
 
     Ok(())
 }
@@ -136,7 +158,8 @@ async fn main() -> Result<()> {
 async fn listen_for_connections(
     rooms: Arc<Vec<Mutex<Room>>>,
     verifier: Arc<RemoteJwksVerifier>,
-    conn: redis::aio::ConnectionManager
+    conn: redis::aio::ConnectionManager,
+    clock: Instant
 ) -> Result<()> {
     let addr = "0.0.0.0:8000".to_string();
     let listener = TcpListener::bind(&addr).await?;
@@ -146,7 +169,8 @@ async fn listen_for_connections(
             stream,
             Arc::clone(&rooms),
             Arc::clone(&verifier),
-            conn.clone()
+            conn.clone(),
+            clock.clone()
         ));
     }
 
@@ -196,7 +220,8 @@ async fn broadcast_available_rooms(
 async fn handle_match_found(
     info: redis::PushInfo,
     rooms: Arc<Vec<Mutex<Room>>>,
-    mut conn: redis::aio::ConnectionManager
+    mut conn: redis::aio::ConnectionManager,
+    clock: Instant
 ) -> Result<()> {
     match info.kind {
         redis::PushKind::Message => {
@@ -210,6 +235,7 @@ async fn handle_match_found(
             let room_id: usize = message.parse()?;
             rooms[room_id].lock().await.active = true;
             let rooms = Arc::clone(&rooms);
+            let clock = clock.clone();
             tokio::spawn(async move {
                 let mut cmd = redis::cmd("GET");
                 cmd.arg(format!("room:{}:keys", room_id));
@@ -219,10 +245,15 @@ async fn handle_match_found(
                 {
                     let mut room = rooms[room_id].lock().await;
                     room.keys = Some(keys);
+
                     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
                     let now: u64 = now.try_into()?;
                     let timestamp = room.keys.as_ref()
                         .ok_or(anyhow!("Room keys not found"))?.timestamp;
+
+                    let clock_time: u64 = clock.elapsed().as_millis().try_into()?;
+                    room.start_time = clock_time + timestamp - now;
+
                     let target: u64 = timestamp + 20000;
                     delay = if now < target {
                         std::time::Duration::from_millis(target - now)
@@ -265,7 +296,8 @@ struct Auth {
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     verifier: Arc<RemoteJwksVerifier>,
     rooms: Arc<Vec<Mutex<Room>>>,
-    conn: redis::aio::ConnectionManager
+    conn: redis::aio::ConnectionManager,
+    clock: Instant
 }
 
 impl Auth {
@@ -273,13 +305,15 @@ impl Auth {
         write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
         verifier: Arc<RemoteJwksVerifier>,
         rooms: Arc<Vec<Mutex<Room>>>,
-        conn: redis::aio::ConnectionManager
+        conn: redis::aio::ConnectionManager,
+        clock: Instant
     ) -> Auth {
         Auth {
             write,
             verifier,
             rooms,
-            conn
+            conn,
+            clock
         }
     }
 
@@ -302,7 +336,8 @@ impl Auth {
                             sub_id: header_and_claims.claims().sub.clone().expect("sub not found"),
                             write: self.write,
                             rooms: self.rooms,
-                            conn: self.conn
+                            conn: self.conn,
+                            clock: self.clock
                         }))
                     }
                     Err(err) => {
@@ -324,7 +359,8 @@ struct Lobby {
     sub_id: String,
     write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     rooms: Arc<Vec<Mutex<Room>>>,
-    conn: redis::aio::ConnectionManager
+    conn: redis::aio::ConnectionManager,
+    clock: Instant
 }
 
 impl Lobby {
@@ -334,13 +370,14 @@ impl Lobby {
     ) -> Result<ServerState> {
         match msg {
             Message::Text(text) => {
-                match serde_json::from_str::<ConnectionRequest>(&text) {
-                    Ok(request) => {
-                        let room_id = request.room as usize;
+                match serde_json::from_str::<Request>(&text) {
+                    Ok(Request::JoinRoom { room, key }) => {
+                        let room_id = room as usize;
                         let room = &self.rooms[room_id];
                         let color: Color;
-                        let current_position: String;
                         let prev_player: Option<Player>;
+                        let current_position: String;
+                        let start_time: u64;
                         {
                             let mut room = room.lock().await;
                             if !room.active {
@@ -350,9 +387,9 @@ impl Lobby {
                                 self.write.lock().await.send(response).await?;
                                 return Ok(ServerState::Lobby(self));
                             }
-                            if Some(request.key) == room.keys.as_ref().map(|k| k.keys[0]) {
+                            if Some(key) == room.keys.as_ref().map(|k| k.keys[0]) {
                                 color = Color::White;
-                            } else if Some(request.key) == room.keys.as_ref().map(|k| k.keys[1]) {
+                            } else if Some(key) == room.keys.as_ref().map(|k| k.keys[1]) {
                                 color = Color::Black;
                             } else {
                                 drop(room);
@@ -367,6 +404,7 @@ impl Lobby {
                                 write_stream: self.write.clone()
                             });
                             current_position = format!("{}", room.game.current_position());
+                            start_time = room.start_time;
                         }
 
                         if let Some(player) = prev_player {
@@ -383,7 +421,12 @@ impl Lobby {
                             let response = Message::Text(serde_json::to_string(&response)?.into());
                             self.write.lock().await.send(response).await?;
 
-                            let response = Response::Fen { fen: current_position.clone() };
+                            let response = Response::Fen {
+                                fen: current_position.clone(),
+                                timestamp: start_time,
+                                white_time: 20000,
+                                black_time: 0
+                            };
                             let response = Message::Text(serde_json::to_string(&response)?.into());
                             self.write.lock().await.send(response).await?;
 
@@ -396,7 +439,7 @@ impl Lobby {
                                 let mut room = room.lock().await;
                                 let room_keys = room.keys.as_ref();
                                 if let Some(room_keys) = room_keys
-                                    && room_keys.keys[color.to_index()] != request.key {
+                                    && room_keys.keys[color.to_index()] != key {
                                     return Err(err);
                                 }
                                 room.players[color.to_index()] = None;
@@ -410,13 +453,22 @@ impl Lobby {
 
                         Ok(ServerState::Game(GameInner {
                             sub_id: self.sub_id,
-                            key: request.key,
+                            key: key,
                             write: self.write,
                             rooms: self.rooms,
                             room_id,
                             color,
-                            conn: self.conn
+                            conn: self.conn,
+                            clock: self.clock
                         }))
+                    }
+                    Ok(Request::TimeSync) => {
+                        let elapsed = self.clock.elapsed().as_millis();
+                        let elapsed: u64 = elapsed.try_into()?;
+                        let response = Response::TimeSync { timestamp: elapsed };
+                        let response = Message::Text(serde_json::to_string(&response)?.into());
+                        self.write.lock().await.send(response).await?;
+                        Ok(ServerState::Lobby(self))
                     }
                     Err(err) => {
                         let response = Response::InvalidRequest { reason: err.to_string() };
@@ -440,7 +492,8 @@ struct GameInner {
     rooms: Arc<Vec<Mutex<Room>>>,
     room_id: usize,
     color: Color,
-    conn: redis::aio::ConnectionManager
+    conn: redis::aio::ConnectionManager,
+    clock: Instant
 }
 
 impl GameInner {
@@ -450,11 +503,36 @@ impl GameInner {
     ) -> Result<ServerState> {
         match msg {
             Message::Text(text) => {
+                let timestamp: u64;
+                let white_time: u64;
+                let black_time: u64;
                 let current_position: String;
                 let opponent_write: Option<Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>>;
                 let game_result: Option<GameResult>;
                 {
                     let mut room = self.rooms[self.room_id].lock().await;
+
+                    let is_first_move = room.game.actions().is_empty();
+
+                    let now = self.clock.elapsed().as_millis();
+                    let now: u64 = now.try_into()?;
+                    let remaining_time = if is_first_move {
+                        room.remaining_time[self.color.to_index()]
+                    } else {
+                        let elapsed = now - room.last_move_time;
+                        let remaining_time = room.remaining_time[self.color.to_index()];
+                        if elapsed > 2000 {
+                            remaining_time.saturating_sub(elapsed - 2000)
+                        } else {
+                            remaining_time + 2000 - elapsed
+                        }
+                    };
+
+                    if remaining_time == 0 {
+                        drop(room);
+                        return Ok(ServerState::Game(self));
+                    }
+                    
                     let room_key = room.keys.as_ref().map(|k| k.keys[self.color.to_index()]);
                     if room_key != Some(self.key) {
                         drop(room);
@@ -478,14 +556,56 @@ impl GameInner {
                         self.write.lock().await.send(response).await?;
                         return Ok(ServerState::Game(self));
                     }
+
+                    if let Some(player_timeout) = room.player_timeout.take() {
+                        player_timeout.abort();
+                    }
+
+                    room.remaining_time[self.color.to_index()] = remaining_time;
+                    room.last_move_time = now;
+                    timestamp = room.last_move_time;
+                    white_time = room.remaining_time[0];
+                    black_time = room.remaining_time[1];
+
                     current_position = format!("{}", &room.game.current_position());
                     opponent_write = room.players[self.color.to_index() ^ 1]
                         .as_ref()
                         .map(|p| Arc::clone(&p.write_stream));
                     game_result = room.game.result();
+
+                    if game_result.is_none() {
+                        let remaining_time = room.remaining_time[self.color.to_index() ^ 1];
+                        let color = self.color;
+                        let rooms = Arc::clone(&self.rooms);
+                        let room_id = self.room_id;
+                        let write = Arc::clone(&self.write);
+                        let opponent_write = opponent_write.clone();
+                        let conn = self.conn.clone();
+                        let handle = tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(remaining_time)).await;
+                            rooms[room_id].lock().await.player_timeout = None;
+                            reset_room(&rooms[room_id], conn).await?;
+                            let winner = if color == Color::White { "white" } else { "black" };
+                            let response = Response::GameOver { winner: winner.to_string() };
+                            let response = Message::Text(serde_json::to_string(&response)?.into());
+                            write.lock().await.send(response.clone()).await?;
+                            write.lock().await.send(Message::Close(None)).await?;
+                            if let Some(opponent_write) = opponent_write {
+                                opponent_write.lock().await.send(response).await?;
+                                opponent_write.lock().await.send(Message::Close(None)).await?;
+                            }
+                            Ok::<_, anyhow::Error>(())
+                        });
+                        room.player_timeout = Some(handle);
+                    }
                 }
 
-                let response = Response::Fen { fen: current_position.clone() };
+                let response = Response::Fen {
+                    fen: current_position.clone(),
+                    timestamp,
+                    white_time,
+                    black_time
+                };
                 let response = Message::Text(serde_json::to_string(&response)?.into());
                 self.write.lock().await.send(response).await?;
                 if let Some(opponent_write) = opponent_write.clone() {
@@ -493,7 +613,12 @@ impl GameInner {
                     let response = Message::Text(serde_json::to_string(&response)?.into());
                     opponent_write.lock().await.send(response).await?;
 
-                    let response = Response::Fen { fen: current_position.clone() };
+                    let response = Response::Fen {
+                        fen: current_position.clone(),
+                        timestamp,
+                        white_time,
+                        black_time
+                    };
                     let response = Message::Text(serde_json::to_string(&response)?.into());
                     opponent_write.lock().await.send(response).await?;
                 }
@@ -506,6 +631,7 @@ impl GameInner {
                         _ => None
                     };
                     if let Some(response) = response {
+                        reset_room(&self.rooms[self.room_id], self.conn.clone()).await?;
                         let response = Message::Text(serde_json::to_string(&response)?.into());
                         self.write.lock().await.send(response.clone()).await?;
                         self.write.lock().await.send(Message::Close(None)).await?;
@@ -578,7 +704,8 @@ async fn handle_connection(
     stream: TcpStream,
     rooms: Arc<Vec<Mutex<Room>>>,
     verifier: Arc<RemoteJwksVerifier>,
-    conn: redis::aio::ConnectionManager
+    conn: redis::aio::ConnectionManager,
+    clock: Instant
 ) -> Result<()> {
     let (write, mut read) = accept_async(stream).await?.split();
     let write = Arc::new(Mutex::new(write));
@@ -586,9 +713,10 @@ async fn handle_connection(
     let mut hearbeat_interval = interval(Duration::from_secs(25));
     let mut state = ServerState::Auth(Auth::new(
         Arc::clone(&write),
-        Arc::clone(&verifier),
-        Arc::clone(&rooms),
-        conn
+        verifier,
+        rooms,
+        conn,
+        clock
     ));
     loop {
         tokio::select! {

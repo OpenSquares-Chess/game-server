@@ -1,6 +1,6 @@
-use serde::{Serialize, Deserialize};
+use serde::Serialize;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
@@ -20,7 +20,7 @@ pub enum Response {
 
     Move { 
         #[serde(rename = "move")]
-        move_: String,
+        move_: String
     },
 
     InvalidMove,
@@ -29,6 +29,9 @@ pub enum Response {
 
     Fen { 
         fen: String, 
+        timestamp: u64,
+        white_time: u64,
+        black_time: u64
     },
 
     Color { 
@@ -42,4 +45,8 @@ pub enum Response {
     },
 
     GameCanceled,
+
+    TimeSync {
+        timestamp: u64,
+    },
 }
