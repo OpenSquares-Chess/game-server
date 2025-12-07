@@ -846,9 +846,7 @@ async fn handle_connection(
                             }
                         }
                     },
-                    Ok(Some(Err(e))) => return Err(e.into()),
-                    Ok(None) => break,
-                    Err(e) => return Err(e.into()),
+                    _ => break
                 }
             }
         }
