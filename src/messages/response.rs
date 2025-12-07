@@ -40,8 +40,9 @@ pub enum Response {
 
     Connected,
 
-    GameOver{
+    GameOver {
         winner: String,
+        timeout: bool
     },
 
     GameCanceled,
