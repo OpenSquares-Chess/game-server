@@ -101,9 +101,11 @@ async fn reset_room(
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GameRecord {
     player_one_id: String,
     player_two_id: String,
+    result: String,
     player_one_rating: i32,
     player_two_rating: i32,
     date: mongodb::bson::DateTime,
@@ -137,7 +139,7 @@ async fn upload_match(room: &Mutex<Room>) -> Result<()> {
             }
         }
         let pgn = Pgn::from_board(
-            board,
+            board.clone(),
             vec![
                 ("Event", "?"),
                 ("Site", "?"),
@@ -157,9 +159,16 @@ async fn upload_match(room: &Mutex<Room>) -> Result<()> {
         )).await?;
         let db = client.database("accounts");
         let collection = db.collection("games");
+        let result = match board.game_result() {
+            Some(rschess::GameResult::Wins(rschess::Color::White, _)) => "white",
+            Some(rschess::GameResult::Wins(rschess::Color::Black, _)) => "black",
+            Some(rschess::GameResult::Draw(_)) => "draw",
+            _ => "unknown"
+        };
         let game_record = GameRecord {
             player_one_id: room.players[0].as_ref().expect("player 1 missing").account_id.clone(),
             player_two_id: room.players[1].as_ref().expect("player 2 missing").account_id.clone(),
+            result: result.to_string(),
             player_one_rating: 0,
             player_two_rating: 0,
             date: mongodb::bson::DateTime::now(),
